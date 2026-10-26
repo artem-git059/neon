@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# Локальные данные NEON (создаются приложением)
+data/
+config/
+neon-data/
+vault.neon
+todos.json
+*.neon.bak-*
+
+# Прочее
+.DS_Store
