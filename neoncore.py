@@ -505,6 +505,11 @@ def verify_password(password: str) -> bool:
     return _verify_against_config(password, _read_config())
 
 
+def _is_legacy_default(password: str) -> bool:
+    digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(digest, LEGACY_DEFAULT_SHA256)
+
+
 def password_problem(password: str, old_password: str | None = None) -> str | None:
     """Вернуть причину, по которой пароль не подходит, или None."""
     if len(password) < MIN_PASSWORD_LENGTH:
@@ -517,7 +522,7 @@ def password_problem(password: str, old_password: str | None = None) -> str | No
         return "Слишком простой пароль: нужно хотя бы 4 разных символа."
     if password.casefold() in COMMON_PASSWORDS:
         return "Этот пароль слишком распространён."
-    if hashlib.sha256(password.encode("utf-8")).hexdigest() == LEGACY_DEFAULT_SHA256:
+    if _is_legacy_default(password):
         return "Старый пароль по умолчанию больше не подходит — придумайте свой."
     if old_password is not None and password == old_password:
         return "Новый пароль совпадает с текущим."
@@ -643,7 +648,17 @@ def require_login() -> None:
             raise SystemExit(1) from exc
         if accepted:
             if not _has_custom_password(config):
-                password = _force_password_change(password, config)
+                if _is_legacy_default(password):
+                    password = _force_password_change(password, config)
+                else:
+                    # Старый профиль, но пароль уже не дефолтный: просто
+                    # помечаем его как пользовательский, не заставляя менять.
+                    config["version"] = CONFIG_VERSION
+                    config["custom_password"] = True
+                    try:
+                        write_json(CONFIG_FILE, config)
+                    except OSError as exc:
+                        warn(f"Не удалось обновить профиль: {exc}")
             _authenticated = True
             _current_password = password
             success("Добро пожаловать!")
