@@ -86,19 +86,7 @@ def change_password() -> None:
         core.pause()
         return
 
-    new = core.read_password("Новый пароль (от 6 символов): ")
-    if len(new) < 6:
-        core.warn("Слишком короткий пароль — нужно хотя бы 6 символов.")
-        core.pause()
-        return
-    if new == old:
-        core.warn("Новый пароль совпадает со старым.")
-        core.pause()
-        return
-    if new != core.read_password("Повторите новый пароль: "):
-        core.warn("Пароли не совпали.")
-        core.pause()
-        return
+    new = core.prompt_new_password(old_password=old)
 
     # Сначала перешифровываем хранилище паролей старым паролем:
     # если старый ключ вдруг не подходит, общий пароль останется прежним.

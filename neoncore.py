@@ -29,14 +29,35 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-VERSION = "2.0"
+VERSION = "2.1"
 APP_NAME = "NEON"
 
-# Старый пароль из первой версии Neonotes. При первом запуске он
-# превращается в хеш и продолжает работать, пока его не сменят.
-DEFAULT_PASSWORD = "Ilovepelmeni759"
+CONFIG_VERSION = 3
+MIN_PASSWORD_LENGTH = 8
 PBKDF2_ITERATIONS = 240_000
 MAX_LOGIN_ATTEMPTS = 3
+
+# SHA-256 старого пароля по умолчанию. Сам пароль в коде не хранится:
+# хеш нужен только чтобы запретить выбрать это значение снова.
+LEGACY_DEFAULT_SHA256 = (
+    "fb338271ce05e1ac9e5e01ed21247e6bd98a3cf60d64ca6e9118909bc38d6f51"
+)
+
+COMMON_PASSWORDS = {
+    "password",
+    "password1",
+    "password123",
+    "qwerty",
+    "qwerty123",
+    "12345678",
+    "123456789",
+    "1234567890",
+    "admin",
+    "admin123",
+    "letmein",
+    "welcome",
+    "iloveyou",
+}
 
 RULE_WIDTH = 52
 TERMINATOR = "."
@@ -444,7 +465,8 @@ def _hash_password(password: str, salt: bytes, iterations: int) -> str:
 def _new_config(password: str) -> dict[str, Any]:
     salt = secrets.token_bytes(16)
     return {
-        "version": 2,
+        "version": CONFIG_VERSION,
+        "custom_password": True,
         "salt": salt.hex(),
         "iterations": PBKDF2_ITERATIONS,
         "hash": _hash_password(password, salt, PBKDF2_ITERATIONS),
@@ -464,8 +486,12 @@ def _read_config() -> dict[str, Any]:
     return data
 
 
-def verify_password(password: str) -> bool:
-    config = _read_config()
+def _has_custom_password(config: dict[str, Any]) -> bool:
+    """Профиль создан или обновлён версией, где пароль выбирает пользователь."""
+    return config.get("custom_password") is True
+
+
+def _verify_against_config(password: str, config: dict[str, Any]) -> bool:
     try:
         salt = bytes.fromhex(str(config["salt"]))
         iterations = int(config.get("iterations", PBKDF2_ITERATIONS))
@@ -475,6 +501,118 @@ def verify_password(password: str) -> bool:
     return hmac.compare_digest(expected, str(config["hash"]))
 
 
+def verify_password(password: str) -> bool:
+    return _verify_against_config(password, _read_config())
+
+
+def password_problem(password: str, old_password: str | None = None) -> str | None:
+    """Вернуть причину, по которой пароль не подходит, или None."""
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return f"Пароль должен быть не короче {MIN_PASSWORD_LENGTH} символов."
+    if len(password) > 1024:
+        return "Пароль слишком длинный."
+    if password != password.strip():
+        return "Пароль не должен начинаться или заканчиваться пробелом."
+    if len(set(password)) < 4:
+        return "Слишком простой пароль: нужно хотя бы 4 разных символа."
+    if password.casefold() in COMMON_PASSWORDS:
+        return "Этот пароль слишком распространён."
+    if hashlib.sha256(password.encode("utf-8")).hexdigest() == LEGACY_DEFAULT_SHA256:
+        return "Старый пароль по умолчанию больше не подходит — придумайте свой."
+    if old_password is not None and password == old_password:
+        return "Новый пароль совпадает с текущим."
+    return None
+
+
+def prompt_new_password(
+    old_password: str | None = None,
+    title: str | None = None,
+    subtitle: str | None = None,
+) -> str:
+    """Запросить новый пароль с проверкой и подтверждением."""
+    if title is not None:
+        header(title, subtitle)
+        print()
+    info(
+        f"Минимум {MIN_PASSWORD_LENGTH} символов. "
+        "В настройках хранится только соль и хеш, не сам пароль."
+    )
+    print()
+    while True:
+        first = read_password("Придумайте пароль: ")
+        problem = password_problem(first, old_password)
+        if problem:
+            warn(problem)
+            continue
+        second = read_password("Повторите пароль: ")
+        if first != second:
+            warn("Пароли не совпали.")
+            continue
+        return first
+
+
+def _first_run_setup() -> None:
+    """Создать профиль: пароль придумывает пользователь, дефолта нет."""
+    global _authenticated, _current_password
+    password = prompt_new_password(
+        title="Первый запуск NEON",
+        subtitle="Придумайте свой пароль — пароля по умолчанию нет",
+    )
+    try:
+        write_json(CONFIG_FILE, _new_config(password))
+    except OSError as exc:
+        error(f"Не удалось сохранить настройки: {exc}")
+        raise SystemExit(1) from exc
+    _authenticated = True
+    _current_password = password
+    success(f"Профиль создан в {CONFIG_DIR}. Пароль установлен.")
+
+
+def _force_password_change(
+    old_password: str, config: dict[str, Any]
+) -> str:
+    """Заменить пароль из старой версии на выбранный пользователем."""
+    new_password = prompt_new_password(
+        old_password=old_password,
+        title="Нужен новый пароль",
+        subtitle="Старый пароль по умолчанию больше не используется",
+    )
+
+    neo = None
+    vault_existed = False
+    backup = None
+    try:
+        import NeoPass as neo  # ленивый импорт: NeoPass сам импортирует neoncore
+
+        vault_existed = neo.vault_exists()
+        if vault_existed:
+            backup = neo.rotate_master_password(old_password, new_password)
+    except Exception as exc:  # noqa: BLE001 — показываем причину и не меняем вход
+        error(f"Не удалось перешифровать хранилище паролей: {exc}")
+        warn("Пароль не изменён. Исправьте хранилище или обратитесь к резервной копии.")
+        raise SystemExit(1) from exc
+
+    fresh = _new_config(new_password)
+    fresh["created"] = config.get("created") or fresh["created"]
+    fresh["changed"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        write_json(CONFIG_FILE, fresh)
+    except OSError as exc:
+        if vault_existed and neo is not None:
+            try:
+                neo.rotate_master_password(new_password, old_password)
+            except Exception:  # noqa: BLE001 — откат мог не сработать
+                error("Не удалось вернуть хранилище к старому паролю.")
+        error(f"Не удалось сохранить настройки: {exc}")
+        warn("Пароль не изменён.")
+        raise SystemExit(1) from exc
+
+    if backup:
+        info(f"Резервная копия хранилища: {backup}")
+    success("Пароль изменён.")
+    return new_password
+
+
 def require_login() -> None:
     """Проверить пароль. В рамках одного процесса достаточно одного раза."""
     global _authenticated, _current_password
@@ -482,17 +620,12 @@ def require_login() -> None:
         return
 
     ensure_dirs()
-    created = not CONFIG_FILE.exists()
-    if created:
-        write_json(CONFIG_FILE, _new_config(DEFAULT_PASSWORD))
+    if not CONFIG_FILE.exists():
+        _first_run_setup()
+        return
 
     print()
-    header("Вход в NEON", "Один пароль — все программы" if not created else None)
-    if created:
-        info("Первый запуск: профиль создан в " + str(CONFIG_DIR))
-        info("Пароль по умолчанию — старый пароль Neonotes (см. README.md).")
-        info("Сменить его можно в neon.py → Настройки.")
-        print()
+    header("Вход в NEON", "Один пароль — все программы")
 
     for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
         try:
@@ -502,12 +635,15 @@ def require_login() -> None:
             error("Вход отменён.")
             raise SystemExit(1)
         try:
-            accepted = verify_password(password)
+            config = _read_config()
+            accepted = _verify_against_config(password, config)
         except NeonError as exc:
             error(str(exc))
             error(f"Проверьте файл {CONFIG_FILE}")
             raise SystemExit(1) from exc
         if accepted:
+            if not _has_custom_password(config):
+                password = _force_password_change(password, config)
             _authenticated = True
             _current_password = password
             success("Добро пожаловать!")
@@ -523,7 +659,10 @@ def change_password(new_password: str) -> None:
     """Записать новый пароль в настройки (хеш, не сам пароль)."""
     global _current_password
     config = _read_config()
+    created = config.get("created")
     config.update(_new_config(new_password))
+    if created:
+        config["created"] = created
     config["changed"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     write_json(CONFIG_FILE, config)
     _current_password = new_password
